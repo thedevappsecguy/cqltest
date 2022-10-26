@@ -1,0 +1,165 @@
+# Name of this GitHub Actions workflow.
+name: Semgrep
+
+on:
+  # Scan changed files in PRs (diff-aware scanning):
+  pull_request: {}
+  # Scan mainline branches and report all findings:
+  push:
+    branches: ["master", "main"]
+  # Schedule the CI job (this method uses cron syntax):
+  schedule:
+    - cron: '30 0 1,15 * *' # Scheduled for 00:30 UTC on both the 1st and 15th of the month  
+  workflow_dispatch: {}
+
+jobs:
+
+  semgrep_fullscan:
+    # User-definable name of this GitHub Actions job:
+    name: Scan
+    # If you are self-hosting, change the following `runs-on` value: 
+    runs-on: ubuntu-latest
+    container:
+      # A Docker image with Semgrep installed. Do not change this.
+      image: returntocorp/semgrep
+    # Skip any PR created by dependabot to avoid permission issues:
+    if: (github.actor != 'dependabot[bot]') &&  github.event_name == 'push'
+    steps:
+      # Fetch project source with GitHub Actions Checkout.
+      - uses: actions/checkout@v3
+      # Run the "semgrep ci" command on the command line of the docker image.
+      - name: Run Semgrep scan
+        id: semgrep
+        continue-on-error: true
+        run: | 
+              semgrep scan \
+              --config=p/owasp-top-ten \
+              --severity=ERROR \
+              --strict \
+              --error
+  semgrep:
+    # User-definable name of this GitHub Actions job:
+    name: Scan
+    # If you are self-hosting, change the following `runs-on` value: 
+    runs-on: ubuntu-latest
+    container:
+      # A Docker image with Semgrep installed. Do not change this.
+      image: returntocorp/semgrep
+    # Skip any PR created by dependabot to avoid permission issues:
+    if: (github.actor != 'dependabot[bot]') &&  github.event_name == 'pull_request'
+    steps:
+      # Fetch project source with GitHub Actions Checkout.
+      - uses: actions/checkout@v3
+      # Run the "semgrep ci" command on the command line of the docker image.
+      - name: Run Semgrep scan
+        id: semgrep
+        continue-on-error: true
+        run: | 
+              semgrep ci \
+              --config=p/owasp-top-ten \
+              --json \
+              --suppress-errors \
+              --output semgrep.json
+
+      - name: "Add PR comment"
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            try{
+            let output = require('./semgrep.json');
+            let heading;
+            let response = '';
+            output = output.results;
+            // Get only the ones with ERROR severity
+            output = output.filter(obj => obj.extra.severity == 'ERROR' && obj.extra.metadata.category=='security')
+            //console.log(output)
+            const {data: comments} = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.number,
+            })
+            const found = comments.find(comment => comment.body.includes("Semgrep"));
+
+            if (output.length > 0) {
+                for (let i in output) {
+                  obj = output[i];
+                  console.log(obj.extra.metadata)
+                  let references;
+                  if(obj.extra.metadata.references && obj.extra.metadata.references.length > 0)
+                    references = obj.extra.metadata.references[0];
+                  else
+                    references = obj.extra.metadata['source-rule-url'] || obj.extra.metadata.shortlink
+                  owaspOrCwe = obj.extra.metadata.owasp || obj.extra.metadata.cwe
+                  response += `
+                  Issue: ${obj.extra.message}
+                  OWASP/CWE: ${owaspOrCwe}
+                  Severity: ${obj.extra.severity}
+                  File: ${obj.path}
+                  Line: ${obj.extra.lines.trim()}
+                  Line Number: ${obj.start.line}
+                  Reference: ${references}
+                  -----------------------------------------------------------------------------------------
+                  `;
+                }
+            } else {
+              // cleanup old comment
+              if(found)
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: found.id,
+                });
+            };
+            heading = `⚠️ Semgrep has uncovered ${output.length} code issues following the scan of your pull request.`;
+            let message = "Please consider investigating the findings and remediating the issues.";
+            let summary = "🔎 Detected code issues in your pull request";
+            let guideline = "🛠 Guidelines to remediate code issues";
+            let guideline_points = `
+
+              1. Read more about issues identified in issue and references.  
+              2. Fix the issue in code and push changes`;
+            const final = `#### ${heading}  
+            ${message}  
+    
+            <details><summary>${summary}</summary>
+            ${response}
+            </details>
+            <details><summary>${guideline}</summary>
+            ${guideline_points}
+            </details>
+            <hr></hr>
+            <sup> Semgrep detects security code issues in your source code to help developers and security teams secure the modern development process.  
+        
+
+            if(found)
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: found.id,
+                body: final
+              });
+            else if(output.length>0)
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: final
+              }) 
+            }
+            catch(e){
+            console.log(e);
+            const {data: comments} = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.number,
+            })
+            const found = comments.find(comment => comment.body.includes("Semgrep"));
+            if(found)
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: found.id,
+                });
+            }
